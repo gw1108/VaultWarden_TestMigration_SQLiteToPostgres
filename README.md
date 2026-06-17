@@ -87,11 +87,6 @@ Copy-Item data/db.sqlite3 data/db.sqlite3.premigration.bak -Force
 # Fold committed WAL contents into db.sqlite3 and switch journal mode to DELETE,
 # which also removes the -wal/-shm files so pgloader opens a single, plain DB.
 # Uses the sqlite3 CLI in a throwaway alpine container (no host install needed).
-# NOTE: the SQL is wrapped in \"...\" not "...". Windows PowerShell 5.1 strips
-# embedded double quotes when passing args to a native .exe (docker), so plain
-# "..." reaches sqlite3 as the bare word PRAGMA and fails with
-# 'Parse error in 2nd command line argument: incomplete input'. The \" escaping
-# survives and delivers real quotes to sh. (Harmless on PowerShell 7+.)
 docker run --rm -v ${PWD}/data:/data alpine sh -c `
   'apk add -q --no-cache sqlite >/dev/null; sqlite3 /data/db.sqlite3 \"PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;\"'
 ```
