@@ -210,24 +210,34 @@ DB:
   (`users`, `ciphers`, `folders`, `organizations`), proving the *same* rows moved,
   not merely the same count (`--no-identity` to skip).
 
-If the data gates pass, the script **starts Vaultwarden on Postgres itself** and
-waits for `/alive`, then runs the **runtime checks**:
+If the data gates pass, the script **starts Vaultwarden on Postgres itself** — on
+an **auto-picked free host port** (so it never collides with the everyday Caddy
+stack's published `80`/`443`) — waits for `/alive`, then runs the **runtime
+checks**:
 
 - **Log scan** — greps the container log for database errors (`ERROR`, `FATAL`,
   `panic`, `relation … does not exist`, `error returned from database`).
-- **Health endpoint** — asserts `GET http://localhost/alive` returns 200.
+- **Health endpoint** — asserts `GET /alive` returns 200 on that port.
+
+The app container is the verifier's own resource, so it **auto-removes it once the
+runtime checks finish** (freeing the port too) — a run leaks no container or port.
+Pass `--keep-app` to leave it running for debugging.
 
 Run only part of the flow with `--stage data` (the pre-app gates; leaves the app
-stopped) or `--stage runtime` (log + health against an already-running app).
-Targets and the started container are configurable — `--pg-container`,
-`--app-container`, `--sqlite`, `--image`, `--network`, `--database-url`, `--port`,
-`--health-url`; see `python verify_migration.py --help`.
+stopped) or `--stage runtime` (log + health against an already-running app — it
+discovers that app's published port automatically). Targets and the started
+container are configurable — `--pg-container`, `--app-container`, `--sqlite`,
+`--image`, `--network`, `--database-url`, `--port` (0 = auto), `--health-url`,
+`--keep-app`; see `python verify_migration.py --help`.
 
 ---
 
 ## 4. Teardown (throwaway test)
 
 ```powershell
+# vaultwarden-pg-app is normally already gone (the verifier auto-removes it unless
+# you passed --keep-app); it's listed here as a belt-and-suspenders. `docker rm -f`
+# on a missing container is harmless.
 docker rm -f vaultwarden-pg-app vaultwarden-pg vw-schema 2>$null
 docker network rm vw-migration
 # Postgres used no named volume, so its data is gone with the container.

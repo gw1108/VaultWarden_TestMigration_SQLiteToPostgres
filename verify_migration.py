@@ -20,10 +20,14 @@ CHECKS (in the order the README requires them to run)
                               organizations, proving the *same* rows moved, not
                               just the same count.
   Runtime checks -- need the app up. In the default `all` stage this script starts
-  Vaultwarden on Postgres ITSELF (only after the data gates pass), waits for
-  /alive, then runs:
+  Vaultwarden on Postgres ITSELF (only after the data gates pass) on an
+  auto-picked free host port (so it never clashes with the Caddy stack's 80/443),
+  waits for /alive, then runs:
     3c  log scan            -- grep the container log for DB errors.
     3d  health endpoint     -- GET /alive must return 200.
+  The app container it starts is its own resource: it is auto-removed once the
+  runtime checks finish (freeing the port too), so a run leaks nothing. Pass
+  --keep-app to leave it up for debugging.
 
 HOW IT REACHES EACH SIDE (no third-party packages)
   * SQLite  -- read directly with Python's stdlib sqlite3 (read-only; no CLI).
@@ -45,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -141,6 +146,34 @@ def container_state(name: str) -> str:
     if cp.returncode != 0:
         return "absent"
     return "running" if cp.stdout.strip() == "true" else "stopped"
+
+
+def remove_container(name: str) -> None:
+    """Force-remove a container (also frees any host port it published).
+    Idempotent: a missing container is silently fine, so this is safe to call
+    in cleanup paths whether or not the container actually exists."""
+    run(["docker", "rm", "-f", name])
+
+
+def find_free_port() -> int:
+    """Ask the OS for an unused TCP port: bind to :0, read the assigned port,
+    release it. There's an unavoidable gap before Docker claims the port, so the
+    caller that hands it to `docker run` retries on a bind clash."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def published_port(name: str) -> int | None:
+    """The host port a running container publishes for its :80, or None if it
+    publishes none / isn't found. Lets --stage runtime find the app's port
+    without the caller having to remember which one was auto-picked."""
+    cp = run(["docker", "port", name, "80/tcp"])
+    if cp.returncode != 0 or not cp.stdout.strip():
+        return None
+    # e.g. "0.0.0.0:8080\n[::]:8080" -- take the port off the first mapping line.
+    m = re.search(r":(\d+)\s*$", cp.stdout.splitlines()[0].strip())
+    return int(m.group(1)) if m else None
 
 
 class PG:
@@ -286,17 +319,48 @@ def check_health(url: str) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- app run ----
 
-def start_app(app: str, image: str, network: str, data_dir: str, database_url: str, port: int) -> None:
-    """Start Vaultwarden on Postgres exactly as README §3 does (raises on failure)."""
+# A failed `docker run -d -p ...` on a taken host port looks like one of these.
+PORT_CLASH = re.compile(r"port is already allocated|address already in use|bind for",
+                        re.IGNORECASE)
+
+
+def health_url_for(port: int | None, override: str | None = None) -> str:
+    """The /alive URL for a given published host port. `override` wins; port 80
+    (or an unknown/None port) yields the bare http://localhost/alive form."""
+    if override:
+        return override
+    if not port or port == 80:
+        return "http://localhost/alive"
+    return f"http://localhost:{port}/alive"
+
+
+def start_app(app: str, image: str, network: str, data_dir: str, database_url: str,
+              port: int, attempts: int = 5) -> int:
+    """Start Vaultwarden on Postgres as README §3 does and return the host port it
+    publishes. port=0 auto-picks a free port, retrying on the inherent bind race
+    (something grabbing the port between find_free_port and `docker run`). A fixed
+    non-zero port is tried once so its clash surfaces verbatim. Raises on failure;
+    any container left half-created by a failed attempt is removed first so the
+    name is free to retry and nothing leaks."""
     host_data = Path(data_dir).resolve().as_posix()  # forward slashes for Docker Desktop
-    cp = run([
-        "docker", "run", "-d", "--name", app, "--network", network,
-        "-v", f"{host_data}:/data",
-        "-e", f"DATABASE_URL={database_url}",
-        "-p", f"{port}:80", image,
-    ])
-    if cp.returncode != 0:
-        raise RuntimeError(cp.stderr.strip() or "docker run failed")
+    last_err = "docker run failed"
+    for _ in range(attempts if port == 0 else 1):
+        chosen = port or find_free_port()
+        cp = run([
+            "docker", "run", "-d", "--name", app, "--network", network,
+            "-v", f"{host_data}:/data",
+            "-e", f"DATABASE_URL={database_url}",
+            "-p", f"{chosen}:80", image,
+        ])
+        if cp.returncode == 0:
+            return chosen
+        last_err = cp.stderr.strip() or "docker run failed"
+        # A port-bind failure still leaves a created-but-unstarted container that
+        # holds the --name; drop it before retrying (or before raising).
+        remove_container(app)
+        if port != 0 or not PORT_CLASH.search(last_err):
+            break
+    raise RuntimeError(last_err)
 
 
 def wait_for_alive(url: str, timeout: int) -> bool:
@@ -340,16 +404,19 @@ def main() -> int:
     p.add_argument("--database-url",
                    default="postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden",
                    help="DATABASE_URL the started app uses")
-    p.add_argument("--port", type=int, default=80, help="host port to publish for the app")
-    p.add_argument("--health-url", default=None, help="override the /alive URL (default derives from --port)")
+    p.add_argument("--port", type=int, default=0,
+                   help="host port to publish for the app; 0 (default) auto-picks a free port so "
+                        "it never clashes with the Caddy stack's published 80/443")
+    p.add_argument("--health-url", default=None,
+                   help="override the /alive URL (default derives from the app's actual port)")
+    p.add_argument("--keep-app", action="store_true",
+                   help="leave the app container running after the runtime checks (default: "
+                        "auto-remove it so the verifier leaks no container or port)")
     p.add_argument("--no-identity", action="store_true", help="skip the primary-key identity gate")
     p.add_argument("--alive-timeout", type=int, default=90,
                    help="seconds to wait for /alive after starting the app")
     args = p.parse_args()
 
-    url = args.health_url or (
-        "http://localhost/alive" if args.port == 80 else f"http://localhost:{args.port}/alive"
-    )
     pg = PG(args.pg_container, args.pg_user, args.pg_db)
     do_data = args.stage in ("all", "data")
     do_runtime = args.stage in ("all", "runtime")
@@ -368,74 +435,92 @@ def main() -> int:
 
     print(f"Verifying migration  (stage={args.stage}, pg={args.pg_container}, sqlite={args.sqlite})\n")
     results: list = []
+    started_app = False  # True only once WE start the app -> only then do WE clean it up
 
-    # ---- pre-app data gates ------------------------------------------------
-    if do_data:
-        state = container_state(args.app_container)
-        if args.stage == "all" and state != "absent":
-            print(f"ERROR: app container '{args.app_container}' already exists ({state}). The data "
-                  f"gates must measure the frozen DB before Vaultwarden's housekeeping runs.\n"
-                  f"       Remove it:  docker rm -f {args.app_container}\n"
-                  f"       ...then re-run. (Or run only the runtime checks: --stage runtime.)",
-                  file=sys.stderr)
-            return 2
-        if args.stage == "data" and state == "running":
-            print(f"WARNING: app container '{args.app_container}' is running -- its housekeeping may "
-                  f"already have changed row counts, so the data gates can report a false mismatch.\n")
-
-        con = connect_sqlite_ro(args.sqlite)
-        try:
-            record(results, "3a row-count parity", *check_row_counts(con, pg))
-            record(results, "3b referential integrity", *check_orphans(pg))
-            if not args.no_identity:
-                record(results, "id primary-key identity", *check_identity(con, pg))
-        finally:
-            con.close()
-
-    data_failed = any(status == FAIL for _, status, _ in results)
-
-    # ---- runtime checks (need the app up) ----------------------------------
-    if do_runtime:
-        if args.stage == "all":
-            if data_failed:
-                print("\nData gates FAILED -- not starting Vaultwarden. Fix the migration and re-run.")
-                record(results, "3c log scan", SKIP, "data gates failed")
-                record(results, "3d health endpoint", SKIP, "data gates failed")
-            else:
-                print(f"\nData gates passed -- starting Vaultwarden on Postgres ('{args.app_container}')...")
-                try:
-                    start_app(args.app_container, args.image, args.network,
-                              args.data, args.database_url, args.port)
-                except RuntimeError as e:
-                    record(results, "app start", FAIL, str(e))
-                    record(results, "3c log scan", SKIP, "app did not start")
-                    record(results, "3d health endpoint", SKIP, "app did not start")
-                else:
-                    if not wait_for_alive(url, args.alive_timeout):
-                        print(f"  (note: {url} not 200 within {args.alive_timeout}s -- scanning logs anyway)")
-                    record(results, "3c log scan", *check_logs(args.app_container))
-                    record(results, "3d health endpoint", *check_health(url))
-        else:  # --stage runtime: app must already be up
-            if container_state(args.app_container) != "running":
-                print(f"ERROR: app container '{args.app_container}' is not running. Start it (README §3) "
-                      f"or run the full flow with --stage all.", file=sys.stderr)
+    try:
+        # ---- pre-app data gates --------------------------------------------
+        if do_data:
+            state = container_state(args.app_container)
+            if args.stage == "all" and state != "absent":
+                print(f"ERROR: app container '{args.app_container}' already exists ({state}). The data "
+                      f"gates must measure the frozen DB before Vaultwarden's housekeeping runs.\n"
+                      f"       Remove it:  docker rm -f {args.app_container}\n"
+                      f"       ...then re-run. (Or run only the runtime checks: --stage runtime.)",
+                      file=sys.stderr)
                 return 2
-            record(results, "3c log scan", *check_logs(args.app_container))
-            record(results, "3d health endpoint", *check_health(url))
+            if args.stage == "data" and state == "running":
+                print(f"WARNING: app container '{args.app_container}' is running -- its housekeeping may "
+                      f"already have changed row counts, so the data gates can report a false mismatch.\n")
 
-    # ---- summary -----------------------------------------------------------
-    width = max(len(label) for label, _, _ in results)
-    print("\n" + "=" * 64)
-    print("VERIFICATION SUMMARY")
-    print("=" * 64)
-    for label, status, detail in results:
-        print(f"  [{status:<4}] {label:<{width}}  {detail}")
-    n_fail = sum(1 for _, s, _ in results if s == FAIL)
-    if n_fail:
-        print(f"\n{n_fail} check(s) FAILED -- investigate above.")
-    else:
-        print("\nAll checks passed -- the data transferred with no difference.")
-    return 1 if n_fail else 0
+            con = connect_sqlite_ro(args.sqlite)
+            try:
+                record(results, "3a row-count parity", *check_row_counts(con, pg))
+                record(results, "3b referential integrity", *check_orphans(pg))
+                if not args.no_identity:
+                    record(results, "id primary-key identity", *check_identity(con, pg))
+            finally:
+                con.close()
+
+        data_failed = any(status == FAIL for _, status, _ in results)
+
+        # ---- runtime checks (need the app up) ------------------------------
+        if do_runtime:
+            if args.stage == "all":
+                if data_failed:
+                    print("\nData gates FAILED -- not starting Vaultwarden. Fix the migration and re-run.")
+                    record(results, "3c log scan", SKIP, "data gates failed")
+                    record(results, "3d health endpoint", SKIP, "data gates failed")
+                else:
+                    print(f"\nData gates passed -- starting Vaultwarden on Postgres ('{args.app_container}')...")
+                    try:
+                        port = start_app(args.app_container, args.image, args.network,
+                                         args.data, args.database_url, args.port)
+                    except RuntimeError as e:
+                        record(results, "app start", FAIL, str(e))
+                        record(results, "3c log scan", SKIP, "app did not start")
+                        record(results, "3d health endpoint", SKIP, "app did not start")
+                    else:
+                        started_app = True
+                        url = health_url_for(port, args.health_url)
+                        print(f"  started on host port {port}; waiting for {url} ...")
+                        if not wait_for_alive(url, args.alive_timeout):
+                            print(f"  (note: {url} not 200 within {args.alive_timeout}s -- scanning logs anyway)")
+                        record(results, "3c log scan", *check_logs(args.app_container))
+                        record(results, "3d health endpoint", *check_health(url))
+            else:  # --stage runtime: app must already be up (we did NOT start it)
+                if container_state(args.app_container) != "running":
+                    print(f"ERROR: app container '{args.app_container}' is not running. Start it (README §3) "
+                          f"or run the full flow with --stage all.", file=sys.stderr)
+                    return 2
+                # We don't own this container -- discover its port rather than guess.
+                port = args.port or published_port(args.app_container)
+                url = health_url_for(port, args.health_url)
+                record(results, "3c log scan", *check_logs(args.app_container))
+                record(results, "3d health endpoint", *check_health(url))
+
+        # ---- summary -------------------------------------------------------
+        width = max(len(label) for label, _, _ in results)
+        print("\n" + "=" * 64)
+        print("VERIFICATION SUMMARY")
+        print("=" * 64)
+        for label, status, detail in results:
+            print(f"  [{status:<4}] {label:<{width}}  {detail}")
+        n_fail = sum(1 for _, s, _ in results if s == FAIL)
+        if n_fail:
+            print(f"\n{n_fail} check(s) FAILED -- investigate above.")
+        else:
+            print("\nAll checks passed -- the data transferred with no difference.")
+        return 1 if n_fail else 0
+    finally:
+        # Clean up only what WE allocated: the app container we started (which
+        # also frees its host port). Runs on success, failure, or Ctrl-C, so a
+        # verifier run never leaks a container or a bound port.
+        if started_app and not args.keep_app:
+            print(f"\nCleaning up: removing app container '{args.app_container}' (frees its port).")
+            remove_container(args.app_container)
+        elif started_app:
+            print(f"\nLeaving app container '{args.app_container}' up (--keep-app). "
+                  f"Remove it later:  docker rm -f {args.app_container}")
 
 
 if __name__ == "__main__":
