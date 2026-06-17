@@ -1,0 +1,20 @@
+# Local HTTPS for the Vaultwarden web vault.
+#
+# The `localhost` site address makes Caddy auto-issue a certificate from its built-in
+# local CA and serve HTTPS on :443 (HTTP on :80 is auto-redirected). WebSocket
+# notifications are proxied automatically — no extra config needed.
+#
+# To remove the browser's "not trusted" warning, trust Caddy's local root CA once:
+#   docker cp caddy:/data/caddy/pki/authorities/local/root.crt .
+#   certutil -addstore -user Root root.crt      # then restart the browser
+#
+# Alternative for a warning-free cert without importing Caddy's CA: generate one with
+# `mkcert -install && mkcert localhost`, mount it, and replace the block below with:
+#   localhost {
+#       tls /certs/localhost.pem /certs/localhost-key.pem
+#       reverse_proxy vaultwarden:80
+#   }
+
+localhost {
+	reverse_proxy vaultwarden:80
+}

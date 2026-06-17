@@ -1,0 +1,23 @@
+# pgloader command file: copy the Vaultwarden SQLite data into an
+# ALREADY-CREATED PostgreSQL schema (see README "Step 3" — Vaultwarden
+# builds the schema, pgloader only copies rows).
+#
+# Paths are container paths: this whole folder is bind-mounted at /data, and
+# the Postgres container is reachable as `vaultwarden-pg` on the `vw-migration`
+# Docker network. Run with:
+#   docker run --rm --network vw-migration \
+#     -v C:/GameDev/vaultwarden_testmigration:/data \
+#     dimitri/pgloader:latest pgloader /data/vaultwarden.load
+
+LOAD DATABASE
+     FROM      sqlite:///data/db.sqlite3
+     INTO      postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden
+
+ WITH data only, truncate, disable triggers, reset sequences
+
+ SET  work_mem to '16MB', maintenance_work_mem to '512MB'
+
+ -- Keep the migration bookkeeping that Vaultwarden wrote for the *Postgres*
+ -- backend. The SQLite copy of this table lists the SQLite migration versions,
+ -- which Postgres-Vaultwarden would reject — so never overwrite it.
+ EXCLUDING TABLE NAMES MATCHING '__diesel_schema_migrations';

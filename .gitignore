@@ -1,0 +1,19 @@
+# --- SECRETS / REAL DATA — never commit ---------------------------------
+# Live Vaultwarden DB: contains the real account email, an offline-crackable
+# master-password hash, and all (encrypted) vault rows.
+db.sqlite3
+db.sqlite3.bak
+db.sqlite3-wal
+db.sqlite3-shm
+*.sqlite3
+*.sqlite3.bak
+
+# JWT signing private key — forges auth tokens if leaked.
+rsa_key.pem
+*.pem
+*.key
+
+# Attachments / scratch.
+tmp/
+attachments/
+sends/

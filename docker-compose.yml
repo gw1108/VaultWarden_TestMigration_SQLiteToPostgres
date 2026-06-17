@@ -1,0 +1,37 @@
+# Vaultwarden + Caddy (HTTPS reverse proxy) for local testing.
+#
+#   docker compose up -d      ->  browse  https://localhost
+#   docker compose logs -f    ->  follow logs
+#   docker compose down       ->  stop (data persists in this folder / named volumes)
+#
+# HTTPS is REQUIRED even on localhost — the web vault client rejects HTTP API calls
+# ("Insecure URL not allowed. All URLs must use HTTPS."). Caddy terminates TLS and
+# proxies to Vaultwarden over the internal compose network in plain HTTP, so the
+# Vaultwarden container itself (and the SQLite->Postgres migration workflow) is unchanged.
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.36.0
+    container_name: vaultwarden
+    volumes:
+      - C:/GameDev/vaultwarden_testmigration:/data
+    restart: unless-stopped
+    # No host port published — Caddy reaches it as http://vaultwarden:80 on the compose network.
+
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    depends_on:
+      - vaultwarden
+    ports:
+      - "80:80"     # HTTP — Caddy auto-redirects to HTTPS
+      - "443:443"   # HTTPS web vault
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # Caddy's local CA + issued certs live here
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
