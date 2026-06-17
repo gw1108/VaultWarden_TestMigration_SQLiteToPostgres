@@ -17,3 +17,6 @@ rsa_key.pem
 tmp/
 attachments/
 sends/
+
+# Python bytecode cache.
+__pycache__/

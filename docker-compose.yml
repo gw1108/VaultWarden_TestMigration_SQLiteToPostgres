@@ -14,7 +14,7 @@ services:
     image: vaultwarden/server:1.36.0
     container_name: vaultwarden
     volumes:
-      - C:/GameDev/vaultwarden_testmigration:/data
+      - ./data:/data
     restart: unless-stopped
     # No host port published — Caddy reaches it as http://vaultwarden:80 on the compose network.
 

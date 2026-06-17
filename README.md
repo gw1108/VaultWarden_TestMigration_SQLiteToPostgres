@@ -7,15 +7,37 @@ of this project. Commands use PowerShell line continuations (`` ` ``).
 
 ---
 
-## 1. Install pgloader on this PC
+## 0. (Optional) Seed bulk test data
 
-**pgloader has no official Windows build.** Per the upstream install docs,
-building on Windows is "supported in theory" but the maintainers don't keep it
-working, and there are no Windows binaries. The native packages
+To give the migration real volume to copy and verify, `seed_testdata.py` inserts
+synthetic, schema-valid rows into the SQLite DB (every non-system table, with edge
+values). It writes to `data/db.sqlite3` by default and backs it up to
+`data/db.sqlite3.bak` first. **Stop Vaultwarden before seeding** — SQLite allows
+only one writer.
+
+Roughly **3 MB** of seed data (measured against this `1.36.0` schema, on top of the
+~280 KB starter DB):
+
+```powershell
+docker compose stop vaultwarden
+python seed_testdata.py --users 60 --orgs 8
+docker compose start vaultwarden
+```
+
+Size scales ~linearly at ~0.045 MB/user (orgs scaled alongside): `--users 50` ≈
+2.6 MB, `--users 60 --orgs 8` ≈ 2.9 MB, `--users 100` ≈ 4.9 MB. Tune `--users` up
+or down for a different target. Remove all seeded rows later with
+`python seed_testdata.py --clear`.
+
+---
+
+## 1. Install pgloader
+
+**pgloader has no official Windows build.** building on Windows is "supported in theory"
+but the maintainers don't keep it working, and there are no Windows binaries. The native packages
 (`apt-get install pgloader`, `brew`, `yum`) are Linux/macOS only.
 
-On Windows the practical, supported option is the **official Docker image** —
-which also keeps this test 100% reproducible and matches the existing setup:
+On Windows the practical, supported option is the **official Docker image**:
 
 ```powershell
 docker pull dimitri/pgloader:latest
