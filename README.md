@@ -64,14 +64,31 @@ itself it picks generic types that Diesel later rejects, and Vaultwarden won't
 start. So we let **Vaultwarden build the correct Postgres schema first**, then
 have pgloader copy **data only** into it. This is the reliable path.
 
-### Step 0 — quiesce SQLite
+### Step 0 — quiesce SQLite and fold in the WAL
 
-Stop the running server so the SQLite file isn't being written during the copy.
-Keep `db.sqlite3-wal` / `-shm` next to `db.sqlite3` (libsqlite3 reads them for a
-consistent snapshot).
+Stop the running server so the SQLite file isn't being written during the copy,
+then **checkpoint the WAL into `db.sqlite3` and drop WAL mode** so pgloader reads
+the whole database from a single file. Do **not** rely on the `-wal` / `-shm`
+sidecars for a consistent snapshot here: pgloader opens the DB from inside the
+`dimitri/pgloader` container over the Docker Desktop **Windows bind mount**, where
+SQLite's WAL/SHM locking is historically unreliable — uncheckpointed rows can be
+missed silently (row counts still "match" in §3a because *both* engines miss the
+same rows, so the bug hides). Collapsing everything into the main file before the
+copy sidesteps that entirely. The row *data* is unchanged — the WAL only held
+already-committed rows — and Vaultwarden re-enables WAL on its next SQLite boot.
 
 ```powershell
 docker compose stop vaultwarden     # or, if you used `docker run`:  docker rm -f vaultwarden
+
+# Optional but cheap: snapshot the source DB before touching it (distinct name so
+# it won't clobber the seed step's db.sqlite3.bak).
+Copy-Item data/db.sqlite3 data/db.sqlite3.premigration.bak -Force
+
+# Fold committed WAL contents into db.sqlite3 and switch journal mode to DELETE,
+# which also removes the -wal/-shm files so pgloader opens a single, plain DB.
+# Uses the sqlite3 CLI in a throwaway alpine container (no host install needed).
+docker run --rm -v ${PWD}/data:/data alpine sh -c `
+  'apk add -q --no-cache sqlite >/dev/null; sqlite3 /data/db.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"'
 ```
 
 ### Step 1 — network + an empty PostgreSQL
@@ -303,7 +320,10 @@ hash) proves identity, not just count.
 docker rm -f vaultwarden-pg-app vaultwarden-pg vw-schema 2>$null
 docker network rm vw-migration
 # Postgres used no named volume, so its data is gone with the container.
-# Your original db.sqlite3 is untouched — restart SQLite mode with: docker compose up -d
+# Your db.sqlite3 data is intact (Step 0 only checkpointed the WAL into it and
+# dropped WAL mode; Vaultwarden re-enables WAL on boot). Restart SQLite mode with:
+#   docker compose up -d
+# To revert even that metadata change, restore data/db.sqlite3.premigration.bak.
 ```
 
 ---
