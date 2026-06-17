@@ -72,8 +72,8 @@ the whole database from a single file. Do **not** rely on the `-wal` / `-shm`
 sidecars for a consistent snapshot here: pgloader opens the DB from inside the
 `dimitri/pgloader` container over the Docker Desktop **Windows bind mount**, where
 SQLite's WAL/SHM locking is historically unreliable — uncheckpointed rows can be
-missed silently (row counts still "match" in §3a because *both* engines miss the
-same rows, so the bug hides). Collapsing everything into the main file before the
+missed silently (the row-count gate in §3 still "matches" because *both* engines
+miss the same rows, so the bug hides). Collapsing everything into the main file before the
 copy sidesteps that entirely. The row *data* is unchanged — the WAL only held
 already-committed rows — and Vaultwarden re-enables WAL on its next SQLite boot.
 
@@ -162,155 +162,61 @@ END $$;
 '@ | docker exec -i vaultwarden-pg psql -U vaultwarden -d vaultwarden -v ON_ERROR_STOP=1
 ```
 
-**Do not start the app yet.** Run the data gates in §3a/§3b first — they query the
-freshly loaded database directly and must be measured before any Vaultwarden
-housekeeping runs (see §3).
+**Do not start the app yet.** Run the verifier first (`python verify_migration.py`)
+— its data gates query the freshly loaded database directly and must be measured
+before any Vaultwarden housekeeping runs (see §3). The verifier starts the app for
+you once those gates pass.
 
 ---
 
 ## 3. Verify the migration (fully automated — no human spot-check)
 
-Verification is entirely automated. There is **no** logging in by hand and no
-eyeballing vault items. Four checks decide pass/fail: per-table row-count parity
-across **every** table and a referential-integrity (orphan) scan over every
-foreign key — both run against the just-loaded database **before the app is
-started** — then a log scan for database errors and the health endpoint, run
-after the app is up. Order matters: start Vaultwarden only *after* §3a/§3b pass,
-because its scheduled housekeeping (incomplete-2FA purge, trashed-cipher purge,
-expired send/auth-request cleanup) deletes rows the frozen SQLite source still
-holds — counting a *running* database would report a false mismatch. If all four
-print `PASS`, the data transferred with no difference; any `FAIL`/mismatch is the
-signal to investigate.
-
-### 3a. Row-count parity across every table (the hard gate)
-
-Dump a sorted `table|count` list from each engine — excluding
-`__diesel_schema_migrations` (its rows legitimately differ between backends) —
-then diff the two lists. An empty diff means every table matches row-for-row.
+Verification is one command — [`verify_migration.py`](./verify_migration.py), run
+from the repo root after the pgloader copy (§2) and **before** you use the vault.
+There is no logging in by hand and no eyeballing vault items.
 
 ```powershell
-# SQLite: count every user table (sqlite3 via a tiny alpine container)
-docker run --rm -v ${PWD}/data:/data alpine sh -c 'apk add -q --no-cache sqlite >/dev/null; for t in $(sqlite3 /data/db.sqlite3 "select name from sqlite_master where type=''table'' and name not like ''sqlite_%'' and name<>''__diesel_schema_migrations'' order by name;"); do printf "%s|%s\n" "$t" "$(sqlite3 /data/db.sqlite3 "select count(*) from $t;")"; done' | Sort-Object | Set-Content sqlite_counts.txt
-
-# Postgres: count every public table (query_to_xml runs count(*) per table in one query)
-docker exec vaultwarden-pg psql -U vaultwarden -d vaultwarden -At -F '|' -c "select table_name, (xpath('/row/c/text()', query_to_xml(format('select count(*) c from %I', table_name), false, true, '')))[1]::text::int from information_schema.tables where table_schema='public' and table_name<>'__diesel_schema_migrations' order by table_name;" | Sort-Object | Set-Content pg_counts.txt
-
-# Diff — empty output means a pass
-$diff = Compare-Object (Get-Content sqlite_counts.txt) (Get-Content pg_counts.txt)
-if ($diff) { $diff | Format-Table; Write-Error 'FAIL: row-count mismatch' } else { 'PASS: all tables match row-for-row' }
+python verify_migration.py        # data gates → start app on Postgres → runtime checks
 ```
 
-### 3b. Referential integrity — zero orphaned rows
+It runs five automated gates and **exits non-zero if any fails**, so it drops
+straight into CI or a PowerShell `if ($LASTEXITCODE) { ... }` check. Stdlib only —
+no `pip install`. It reads SQLite directly with Python's built-in `sqlite3`
+(read-only, no CLI), reaches Postgres through `docker exec <pg> psql` (the
+migration's Postgres publishes no host port), and uses `docker logs` + an HTTP GET
+for the runtime checks.
 
-Row counts can match and the logs can stay clean while the data is still subtly
-corrupt. SQLite historically ships with foreign-key enforcement **off**, so the
-source DB can legitimately hold orphaned rows (a child pointing at a parent that
-no longer exists). pgloader's `disable triggers` then waves those rows straight
-into Postgres — counts match, logs are clean, and the corruption goes
-undetected. Catch it explicitly: after the load, assert that **every** foreign
-key has zero orphans.
+**Pre-app data gates** — measured against the frozen, just-loaded database. They
+must run *before* Vaultwarden starts, because its scheduled housekeeping
+(incomplete-2FA purge, trashed-cipher purge, expired send/auth-request cleanup)
+deletes rows the SQLite source still holds and would fake a mismatch in a running
+DB:
 
-`ALTER TABLE … VALIDATE CONSTRAINT` won't help here — pgloader creates the FKs
-as already-valid (not `NOT VALID`), so there is nothing for `VALIDATE` to
-re-check. Instead, enumerate every FK from the catalog and run the
-`LEFT JOIN … WHERE parent IS NULL` orphan pattern against each child→parent pair
-(handling composite keys), asserting zero orphans in total. `ON_ERROR_STOP=1`
-makes the `RAISE EXCEPTION` set a non-zero exit code, so this is a real gate:
+- **Row-count parity** — counts every table in both engines (excluding
+  `__diesel_schema_migrations`, whose rows legitimately differ between backends)
+  and asserts they match table-for-table.
+- **Referential integrity** — enumerates every foreign key from the Postgres
+  catalog and runs the `LEFT JOIN … WHERE parent IS NULL` orphan scan against each
+  child→parent pair (composite keys included), asserting zero orphans. This catches
+  corruption that row counts and logs miss: SQLite ships with FK enforcement off,
+  so the source can hold orphaned rows that pgloader's `disable triggers` waves
+  straight through.
+- **Primary-key identity** — compares the actual `uuid` *sets* of the major tables
+  (`users`, `ciphers`, `folders`, `organizations`), proving the *same* rows moved,
+  not merely the same count (`--no-identity` to skip).
 
-```powershell
-@'
-DO $$
-DECLARE
-  r            record;
-  join_cond    text;
-  notnull_cond text;
-  parent_col   text;
-  n            bigint;
-  total        bigint := 0;
-BEGIN
-  FOR r IN
-    SELECT con.conname,
-           cl.relname AS child,
-           cf.relname AS parent,
-           con.conrelid, con.confrelid, con.conkey, con.confkey
-    FROM pg_constraint con
-    JOIN pg_class     cl ON cl.oid = con.conrelid
-    JOIN pg_class     cf ON cf.oid = con.confrelid
-    JOIN pg_namespace ns ON ns.oid = cl.relnamespace
-    WHERE con.contype = 'f' AND ns.nspname = 'public'
-  LOOP
-    -- Build the join + not-null predicates across (possibly composite) FK columns.
-    SELECT string_agg(format('c.%I = p.%I', ca.attname, pa.attname), ' AND '),
-           string_agg(format('c.%I IS NOT NULL', ca.attname),        ' AND ')
-      INTO join_cond, notnull_cond
-    FROM unnest(r.conkey, r.confkey) WITH ORDINALITY AS k(c_attnum, p_attnum, ord)
-    JOIN pg_attribute ca ON ca.attrelid = r.conrelid  AND ca.attnum = k.c_attnum
-    JOIN pg_attribute pa ON pa.attrelid = r.confrelid AND pa.attnum = k.p_attnum;
+If the data gates pass, the script **starts Vaultwarden on Postgres itself** and
+waits for `/alive`, then runs the **runtime checks**:
 
-    -- A referenced column is NOT NULL, so "p.<col> IS NULL" means no parent matched.
-    SELECT attname INTO parent_col
-    FROM pg_attribute WHERE attrelid = r.confrelid AND attnum = r.confkey[1];
+- **Log scan** — greps the container log for database errors (`ERROR`, `FATAL`,
+  `panic`, `relation … does not exist`, `error returned from database`).
+- **Health endpoint** — asserts `GET http://localhost/alive` returns 200.
 
-    EXECUTE format(
-      'SELECT count(*) FROM %I c LEFT JOIN %I p ON %s WHERE %s AND p.%I IS NULL',
-      r.child, r.parent, join_cond, notnull_cond, parent_col
-    ) INTO n;
-
-    IF n > 0 THEN
-      RAISE WARNING 'ORPHANS: % row(s) in public.% violate FK % -> public.%',
-                    n, r.child, r.conname, r.parent;
-      total := total + n;
-    END IF;
-  END LOOP;
-
-  IF total > 0 THEN
-    RAISE EXCEPTION 'FAIL: % orphaned row(s) across all foreign keys', total;
-  END IF;
-  RAISE NOTICE 'PASS: zero orphaned rows across all foreign keys';
-END $$;
-'@ | docker exec -i vaultwarden-pg psql -U vaultwarden -d vaultwarden -v ON_ERROR_STOP=1
-```
-
-A clean run prints `PASS: zero orphaned rows across all foreign keys` and exits
-0. Any orphan prints a `WARNING` naming the offending table/constraint, then the
-final `RAISE EXCEPTION` makes psql exit non-zero (check `$LASTEXITCODE`).
-
-### Start Vaultwarden on Postgres (only after §3a/§3b pass)
-
-The data gates above run against the static, just-loaded database. With those
-green, bring the app up — the remaining two checks (log scan, health) need it
-running:
-
-```powershell
-docker run -d --name vaultwarden-pg-app --network vw-migration `
-  -v ${PWD}/data:/data `
-  -e DATABASE_URL=postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden `
-  -p 80:80 vaultwarden/server:1.36.0
-
-docker logs vaultwarden-pg-app --tail 30    # expect no DB errors, "Rocket has launched"
-```
-
-### 3c. Log scan — no database errors
-
-```powershell
-$dberr = docker logs vaultwarden-pg-app 2>&1 |
-  Select-String -Pattern 'ERROR|error returned from database|relation .* does not exist|panic|FATAL'
-if ($dberr) { $dberr; Write-Error 'FAIL: database errors in log' } else { 'PASS: no DB errors in log' }
-```
-
-### 3d. Health endpoint
-
-```powershell
-if ((Invoke-WebRequest http://localhost/alive -UseBasicParsing).StatusCode -eq 200) { 'PASS: /alive returns 200' } else { Write-Error 'FAIL: /alive not 200' }
-```
-
-**Optional deeper content check (dialect-safe checksum).** Row counts prove every
-row is present; to prove they are the *same* rows, diff the actual identities. The
-primary keys are text columns in both engines (e.g. `uuid`/`id`), so they need no
-dialect reformatting and compare directly — `Compare-Object` the sorted PK column
-of the major tables (`users`, `ciphers`, `folders`, `organizations`) pulled from
-each engine, or `md5`/`Get-FileHash` those sorted lists. An empty diff (identical
-hash) proves identity, not just count.
+Run only part of the flow with `--stage data` (the pre-app gates; leaves the app
+stopped) or `--stage runtime` (log + health against an already-running app).
+Targets and the started container are configurable — `--pg-container`,
+`--app-container`, `--sqlite`, `--image`, `--network`, `--database-url`, `--port`,
+`--health-url`; see `python verify_migration.py --help`.
 
 ---
 
