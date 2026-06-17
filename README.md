@@ -5,6 +5,10 @@ data (`db.sqlite3`) into PostgreSQL and confirm Vaultwarden runs identically
 against it. Everything runs through Docker Desktop / PowerShell, like the rest
 of this project. Commands use PowerShell line continuations (`` ` ``).
 
+> **Run every command from the repo root.** The `docker run` mounts use
+> `${PWD}/data`, which PowerShell resolves to this project's `data/` folder — so
+> there's no hardcoded absolute path to edit.
+
 ---
 
 ## 0. (Optional) Seed bulk test data
@@ -105,14 +109,17 @@ docker rm -f vw-schema
 
 ### Step 3 — run pgloader (the actual data copy)
 
-The command file [`vaultwarden.load`](./vaultwarden.load) is in this repo. It
-loads `data only`, `truncate`s first (so re-runs are idempotent),
-`disable triggers` (skips FK-ordering pain — the `vaultwarden` role is a
-superuser, which this needs), and **excludes** `__diesel_schema_migrations`.
+The command file [`vaultwarden.load`](./data/vaultwarden.load) lives next to the
+SQLite DB in `data/`. It loads `data only`, `disable triggers` (skips FK-ordering
+pain — the `vaultwarden` role is a superuser, which this needs), and **excludes**
+`__diesel_schema_migrations`. It deliberately does **not** `truncate`: pgloader
+truncates each table individually and PostgreSQL refuses to `TRUNCATE` a
+FK-referenced table (most of this schema), which `disable triggers` does not fix.
+The schema Vaultwarden just built is empty, so the first load needs no truncate.
 
 ```powershell
 docker run --rm --network vw-migration `
-  -v C:/GameDev/vaultwarden_testmigration:/data `
+  -v ${PWD}/data:/data `
   dimitri/pgloader:latest `
   pgloader /data/vaultwarden.load
 ```
@@ -120,18 +127,27 @@ docker run --rm --network vw-migration `
 Read the summary table pgloader prints: every table should show
 `read` == `imported` with **0 errors**.
 
-### Step 4 — start Vaultwarden on Postgres
+**Re-run reset (idempotency).** pgloader *appends*, so a second load against a
+non-empty DB doubles rows / hits duplicate keys. Before re-running pgloader,
+truncate every table in one FK-safe statement (this keeps the Postgres
+`__diesel_schema_migrations` rows intact):
 
 ```powershell
-docker run -d --name vaultwarden-pg-app --network vw-migration `
-  -v C:/GameDev/vaultwarden_testmigration:/data `
-  -e DATABASE_URL=postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden `
-  -p 80:80 vaultwarden/server:1.36.0
-
-docker logs vaultwarden-pg-app --tail 30    # expect no DB errors, "Rocket has launched"
+@'
+DO $$
+DECLARE tbls text;
+BEGIN
+  SELECT string_agg(format('public.%I', tablename), ', ') INTO tbls
+  FROM pg_tables
+  WHERE schemaname = 'public' AND tablename <> '__diesel_schema_migrations';
+  EXECUTE 'TRUNCATE TABLE ' || tbls || ' RESTART IDENTITY CASCADE';
+END $$;
+'@ | docker exec -i vaultwarden-pg psql -U vaultwarden -d vaultwarden -v ON_ERROR_STOP=1
 ```
 
-`https://localhost/alive` should return 200.
+**Do not start the app yet.** Run the data gates in §3a/§3b first — they query the
+freshly loaded database directly and must be measured before any Vaultwarden
+housekeeping runs (see §3).
 
 ---
 
@@ -139,9 +155,14 @@ docker logs vaultwarden-pg-app --tail 30    # expect no DB errors, "Rocket has l
 
 Verification is entirely automated. There is **no** logging in by hand and no
 eyeballing vault items. Four checks decide pass/fail: per-table row-count parity
-across **every** table, a referential-integrity (orphan) scan over every foreign
-key, a log scan for database errors, and the health endpoint. If all four print
-`PASS`, the data transferred with no difference; any `FAIL`/mismatch is the
+across **every** table and a referential-integrity (orphan) scan over every
+foreign key — both run against the just-loaded database **before the app is
+started** — then a log scan for database errors and the health endpoint, run
+after the app is up. Order matters: start Vaultwarden only *after* §3a/§3b pass,
+because its scheduled housekeeping (incomplete-2FA purge, trashed-cipher purge,
+expired send/auth-request cleanup) deletes rows the frozen SQLite source still
+holds — counting a *running* database would report a false mismatch. If all four
+print `PASS`, the data transferred with no difference; any `FAIL`/mismatch is the
 signal to investigate.
 
 ### 3a. Row-count parity across every table (the hard gate)
@@ -152,7 +173,7 @@ then diff the two lists. An empty diff means every table matches row-for-row.
 
 ```powershell
 # SQLite: count every user table (sqlite3 via a tiny alpine container)
-docker run --rm -v C:/GameDev/vaultwarden_testmigration:/data alpine sh -c 'apk add -q --no-cache sqlite >/dev/null; for t in $(sqlite3 /data/db.sqlite3 "select name from sqlite_master where type=''table'' and name not like ''sqlite_%'' and name<>''__diesel_schema_migrations'' order by name;"); do printf "%s|%s\n" "$t" "$(sqlite3 /data/db.sqlite3 "select count(*) from $t;")"; done' | Sort-Object | Set-Content sqlite_counts.txt
+docker run --rm -v ${PWD}/data:/data alpine sh -c 'apk add -q --no-cache sqlite >/dev/null; for t in $(sqlite3 /data/db.sqlite3 "select name from sqlite_master where type=''table'' and name not like ''sqlite_%'' and name<>''__diesel_schema_migrations'' order by name;"); do printf "%s|%s\n" "$t" "$(sqlite3 /data/db.sqlite3 "select count(*) from $t;")"; done' | Sort-Object | Set-Content sqlite_counts.txt
 
 # Postgres: count every public table (query_to_xml runs count(*) per table in one query)
 docker exec vaultwarden-pg psql -U vaultwarden -d vaultwarden -At -F '|' -c "select table_name, (xpath('/row/c/text()', query_to_xml(format('select count(*) c from %I', table_name), false, true, '')))[1]::text::int from information_schema.tables where table_schema='public' and table_name<>'__diesel_schema_migrations' order by table_name;" | Sort-Object | Set-Content pg_counts.txt
@@ -237,6 +258,21 @@ A clean run prints `PASS: zero orphaned rows across all foreign keys` and exits
 0. Any orphan prints a `WARNING` naming the offending table/constraint, then the
 final `RAISE EXCEPTION` makes psql exit non-zero (check `$LASTEXITCODE`).
 
+### Start Vaultwarden on Postgres (only after §3a/§3b pass)
+
+The data gates above run against the static, just-loaded database. With those
+green, bring the app up — the remaining two checks (log scan, health) need it
+running:
+
+```powershell
+docker run -d --name vaultwarden-pg-app --network vw-migration `
+  -v ${PWD}/data:/data `
+  -e DATABASE_URL=postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden `
+  -p 80:80 vaultwarden/server:1.36.0
+
+docker logs vaultwarden-pg-app --tail 30    # expect no DB errors, "Rocket has launched"
+```
+
 ### 3c. Log scan — no database errors
 
 ```powershell
@@ -301,7 +337,7 @@ services:
     environment:
       DATABASE_URL: postgresql://vaultwarden:vaultwarden@postgres:5432/vaultwarden
     volumes:
-      - C:/GameDev/vaultwarden_testmigration:/data
+      - ./data:/data
     restart: unless-stopped
 
   postgres:

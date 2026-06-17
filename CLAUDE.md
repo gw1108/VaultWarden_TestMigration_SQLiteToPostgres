@@ -41,44 +41,55 @@ This is a test/learning setup, not production.
 
 ## Environment
 - **Host:** Windows 10, Docker Desktop, PowerShell.
-- **Data directory (this folder):** `C:\GameDev\vaultwarden_testmigration` — bind-mounted into the
-  container at `/data`. Contains the live SQLite DB and keys:
+- **Data directory:** the repo's `data/` subfolder (`./data`, relative to the project root) —
+  bind-mounted into the container at `/data`. Contains the live SQLite DB and keys:
   - `db.sqlite3` (+ `-wal`, `-shm`) — the SQLite database.
   - `rsa_key.pem` — JWT signing key (auto-generated; keep it, or all sessions invalidate).
 - **Image:** `vaultwarden/server:1.36.0` (pinned; `latest` resolved to this at setup time).
-- **Container name:** `vaultwarden`.
-- **Port:** host `80` → container `80`. The server answers on `http://localhost` (e.g. `/alive`),
-  but the **web vault UI is unusable over plain HTTP** — see the HTTPS warning above. You must put
-  it behind HTTPS to log in / register / use extensions.
+- **Containers (Docker Compose):** `vaultwarden` (the app, SQLite-backed) and `caddy` (HTTPS
+  reverse proxy). Defined in `docker-compose.yml`; Caddy config in `Caddyfile`.
+- **Ports / access:** **Caddy** publishes host `80` (auto-redirects to HTTPS) and `443` (the HTTPS
+  web vault). **Vaultwarden publishes no host port** — Caddy reaches it as `http://vaultwarden:80`
+  on the internal compose network. Browse the vault at **`https://localhost`**. This satisfies the
+  HTTPS requirement above; plain `http://localhost` only 308-redirects to HTTPS.
 
-## Current state (verified working)
-- Container `vaultwarden` is running, healthy, and **published** on port 80.
-- `GET http://localhost/alive` → 200. The web vault page *loads* but is **not usable over HTTP**
-  (client app rejects HTTP API calls — see the ⚠️ HTTPS warning above).
-- Vaultwarden listens on `0.0.0.0:80` inside the container.
+## Current state
+- The stack runs via **`docker compose up -d`**: `vaultwarden` (SQLite at `/data/db.sqlite3`,
+  internal-only) sits behind `caddy`, which terminates TLS using its built-in **local CA**.
+- The web vault is served at **`https://localhost`** and is *usable* — TLS satisfies the web-vault
+  HTTPS guard. `GET https://localhost/alive` → 200. Caddy's local CA + issued certs live in the
+  `caddy_data` named volume; trust the root once (see `Caddyfile`) to silence the browser warning.
+- Vaultwarden listens on `0.0.0.0:80` *inside* its container; only Caddy is reachable from the host.
 
 ### Run command currently in use
 ```powershell
-docker run -d --name vaultwarden -v C:/GameDev/vaultwarden_testmigration:/data -p 80:80 vaultwarden/server:1.36.0
+# From the repo root (where docker-compose.yml lives). Brings up vaultwarden + caddy.
+docker compose up -d        # then browse https://localhost
 ```
 
 ## Setup history / lessons learned
-1. On Windows `docker run`, use **forward slashes** in the host path (`C:/GameDev/...:/data`) to
-   avoid path-parsing issues with the `:` separator.
+1. Everyday use is **Docker Compose** (`docker compose up -d`), which mounts `./data:/data` for you
+   — no absolute path needed. For the standalone `docker run` commands in the migration recipe
+   (README §2), prefer `${PWD}/data:/data` (run from the repo root) over a hardcoded path; Docker
+   Desktop handles the drive-letter colon. If you do spell a path out, use **forward slashes**
+   (`C:/.../data:/data`) to avoid path-parsing issues with the `:` separator.
+2. HTTPS is served by Caddy with its **local CA** (see the ⚠️ warning) — the web-vault guard rejects
+   plain HTTP even on localhost, so the everyday stack must stay behind Caddy.
 
 ## Handy commands
 ```powershell
-# Status / ports / logs
-docker ps -a --filter "name=vaultwarden" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-docker port vaultwarden          # should show: 80/tcp -> 0.0.0.0:80
-docker logs vaultwarden --tail 60
+# Status / logs (run from the repo root, where docker-compose.yml lives)
+docker compose ps                       # both services + Caddy's 80/443 port mappings
+docker compose logs -f                  # all services; or: docker compose logs vaultwarden --tail 60
 
-# HTTP health check
-Invoke-WebRequest http://localhost/alive -UseBasicParsing   # expect HTTP 200
+# Health check over HTTPS (Caddy's local CA). Trust the CA once so the cert validates:
+#   docker cp caddy:/data/caddy/pki/authorities/local/root.crt .
+#   certutil -addstore -user Root root.crt        # then restart the shell/browser
+Invoke-WebRequest https://localhost/alive -UseBasicParsing   # expect HTTP 200
 
-# Recreate (data preserved in this folder)
-docker rm -f vaultwarden
-docker run -d --name vaultwarden -v C:/GameDev/vaultwarden_testmigration:/data -p 80:80 vaultwarden/server:1.36.0
+# Stop / restart (data preserved in ./data and the caddy_* named volumes)
+docker compose down
+docker compose up -d
 ```
 
 ## Next: SQLite → PostgreSQL migration (planned)
@@ -98,7 +109,7 @@ High-level plan to work through:
 2. Choose/validate a migration method (data-copy tool such as `pgloader`, or a dump→transform→load
    pipeline). Confirm whether the running Vaultwarden version's schema matches between backends.
 3. Stop Vaultwarden, migrate the data, then restart Vaultwarden with `DATABASE_URL` pointing at
-   Postgres (still using this folder for `rsa_key.pem` / attachments / config).
+   Postgres (still using the `./data` folder for `rsa_key.pem` / attachments / config).
 4. **Verify (fully automated — no human check):** compare per-table row counts across **every**
    table between SQLite and Postgres (an empty diff is the pass gate); assert zero orphaned rows
    across **every** foreign key (SQLite's FK enforcement is historically off and pgloader's

@@ -1,0 +1,30 @@
+# pgloader command file: copy the Vaultwarden SQLite data into an
+# ALREADY-CREATED PostgreSQL schema (see README "Step 3" — Vaultwarden
+# builds the schema, pgloader only copies rows).
+#
+# Paths are container paths: the project's `data/` folder is bind-mounted at
+# /data (this file lives in that folder, next to db.sqlite3), and the Postgres
+# container is reachable as `vaultwarden-pg` on the `vw-migration` Docker network.
+# Run from the repo root so ${PWD} resolves to the project directory:
+#   docker run --rm --network vw-migration \
+#     -v ${PWD}/data:/data \
+#     dimitri/pgloader:latest pgloader /data/vaultwarden.load
+
+LOAD DATABASE
+     FROM      sqlite:///data/db.sqlite3
+     INTO      postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden
+
+ -- No `truncate` here: pgloader truncates each target table individually, and
+ -- PostgreSQL rejects TRUNCATE on a table referenced by a foreign key (most of
+ -- this schema) — `disable triggers` does NOT lift that restriction. The schema
+ -- Vaultwarden just built is empty, so a first load needs no truncate. To RE-RUN
+ -- against a non-empty DB, reset it first with one FK-safe statement (README §3
+ -- "Re-run reset") — it truncates all tables together with CASCADE.
+ WITH data only, disable triggers, reset sequences
+
+ SET  work_mem to '16MB', maintenance_work_mem to '512MB'
+
+ -- Keep the migration bookkeeping that Vaultwarden wrote for the *Postgres*
+ -- backend. The SQLite copy of this table lists the SQLite migration versions,
+ -- which Postgres-Vaultwarden would reject — so never overwrite it.
+ EXCLUDING TABLE NAMES MATCHING '__diesel_schema_migrations';
