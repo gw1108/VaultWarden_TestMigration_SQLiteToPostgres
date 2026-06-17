@@ -87,8 +87,13 @@ Copy-Item data/db.sqlite3 data/db.sqlite3.premigration.bak -Force
 # Fold committed WAL contents into db.sqlite3 and switch journal mode to DELETE,
 # which also removes the -wal/-shm files so pgloader opens a single, plain DB.
 # Uses the sqlite3 CLI in a throwaway alpine container (no host install needed).
+# NOTE: the SQL is wrapped in \"...\" not "...". Windows PowerShell 5.1 strips
+# embedded double quotes when passing args to a native .exe (docker), so plain
+# "..." reaches sqlite3 as the bare word PRAGMA and fails with
+# 'Parse error in 2nd command line argument: incomplete input'. The \" escaping
+# survives and delivers real quotes to sh. (Harmless on PowerShell 7+.)
 docker run --rm -v ${PWD}/data:/data alpine sh -c `
-  'apk add -q --no-cache sqlite >/dev/null; sqlite3 /data/db.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"'
+  'apk add -q --no-cache sqlite >/dev/null; sqlite3 /data/db.sqlite3 \"PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;\"'
 ```
 
 ### Step 1 — network + an empty PostgreSQL
@@ -112,11 +117,18 @@ docker logs vaultwarden-pg --tail 5
 
 Run the same image once against Postgres. It runs its migrations, creates every
 table, and writes the correct `__diesel_schema_migrations` rows — then we throw
-this container away. (No `/data` mount needed; it's disposable.)
+this container away. No `/data` mount is needed (the schema lives in Postgres, not
+`/data`), but `1.36.0` treats a missing persistent volume as **fatal** — it logs
+`No persistent volume!` and exits (1) *before* running migrations. So tell it the
+volatile storage is intentional with `I_REALLY_WANT_VOLATILE_STORAGE=true`; the
+container is disposable, so there's nothing in `/data` worth keeping. (Mounting
+`-v ${PWD}/data:/data` also satisfies the check, but writes `rsa_key.pem`/
+`config.json` into your project folder from a container you immediately delete.)
 
 ```powershell
 docker run -d --name vw-schema --network vw-migration `
   -e DATABASE_URL=postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden `
+  -e I_REALLY_WANT_VOLATILE_STORAGE=true `
   vaultwarden/server:1.36.0
 
 # wait for "Rocket has launched from http://0.0.0.0:80" (migrations ran above it)
@@ -178,6 +190,16 @@ There is no logging in by hand and no eyeballing vault items.
 ```powershell
 python verify_migration.py        # data gates → start app on Postgres → runtime checks
 ```
+
+> **Free host port 80 first.** When the data gates pass, the verifier starts
+> `vaultwarden-pg-app` on host port **80** (default) and checks `http://localhost/alive`.
+> The everyday Caddy stack publishes 80/443, so if it's up the start fails with
+> `Bind for 0.0.0.0:80 failed: port is already allocated`. Either stop the stack first
+> (`docker compose stop caddy` — its Vaultwarden backend is already stopped from §2 Step 0
+> anyway) or run the verifier on another port: `python verify_migration.py --port 8080`
+> (the `/alive` URL is derived from `--port`). Also: the verifier does **not** auto-remove
+> its app container — if a prior run left one behind it aborts with a `docker rm -f
+> vaultwarden-pg-app` hint; run that, then re-run.
 
 It runs five automated gates and **exits non-zero if any fails**, so it drops
 straight into CI or a PowerShell `if ($LASTEXITCODE) { ... }` check. Stdlib only —
