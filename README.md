@@ -93,7 +93,7 @@ docker run --rm -v ${PWD}/data:/data alpine sh -c `
 
 ### Step 1 — network + an empty PostgreSQL
 
-A throwaway Postgres with no named volume (so teardown wipes it cleanly):
+(This step is not in the official wiki since they assume you already have a postgres SQL server destination). A throwaway Postgres with no named volume (so teardown wipes it cleanly):
 
 ```powershell
 docker network create vw-migration
