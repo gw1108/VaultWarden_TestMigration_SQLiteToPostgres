@@ -88,7 +88,7 @@ Copy-Item data/db.sqlite3 data/db.sqlite3.premigration.bak -Force
 # which also removes the -wal/-shm files so pgloader opens a single, plain DB.
 # Uses the sqlite3 CLI in a throwaway alpine container (no host install needed).
 docker run --rm -v ${PWD}/data:/data alpine sh -c `
-  'apk add -q --no-cache sqlite >/dev/null; sqlite3 /data/db.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"'
+  'apk add -q --no-cache sqlite >/dev/null; sqlite3 /data/db.sqlite3 \"PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;\"'
 ```
 
 ### Step 1 — network + an empty PostgreSQL
