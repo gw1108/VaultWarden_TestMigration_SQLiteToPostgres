@@ -30,5 +30,4 @@ LOAD DATABASE
  -- backend. The SQLite copy of this table lists the SQLite migration versions,
  -- which Postgres-Vaultwarden would reject — so never overwrite it.
  EXCLUDING TABLE NAMES LIKE '__diesel_schema_migrations'
- ALTER SCHEMA 'bitwarden' RENAME TO 'public'
 ;
