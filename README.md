@@ -112,11 +112,16 @@ docker logs vaultwarden-pg --tail 5
 
 Run the same image once against Postgres. It runs its migrations, creates every
 table, and writes the correct `__diesel_schema_migrations` rows — then we throw
-this container away. (No `/data` mount needed; it's disposable.)
+this container away. No `/data` mount is needed (the schema lives in Postgres, not
+`/data`), but `1.36.0` treats a missing persistent volume as **fatal** — it logs
+`No persistent volume!` and exits (1) *before* running migrations. So tell it the
+volatile storage is intentional with `I_REALLY_WANT_VOLATILE_STORAGE=true`; the
+container is disposable, so there's nothing in `/data` worth keeping.
 
 ```powershell
 docker run -d --name vw-schema --network vw-migration `
   -e DATABASE_URL=postgresql://vaultwarden:vaultwarden@vaultwarden-pg:5432/vaultwarden `
+  -e I_REALLY_WANT_VOLATILE_STORAGE=true `
   vaultwarden/server:1.36.0
 
 # wait for "Rocket has launched from http://0.0.0.0:80" (migrations ran above it)
