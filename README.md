@@ -116,7 +116,9 @@ this container away. No `/data` mount is needed (the schema lives in Postgres, n
 `/data`), but `1.36.0` treats a missing persistent volume as **fatal** — it logs
 `No persistent volume!` and exits (1) *before* running migrations. So tell it the
 volatile storage is intentional with `I_REALLY_WANT_VOLATILE_STORAGE=true`; the
-container is disposable, so there's nothing in `/data` worth keeping.
+container is disposable, so there's nothing in `/data` worth keeping. (Mounting
+`-v ${PWD}/data:/data` also satisfies the check, but writes `rsa_key.pem`/
+`config.json` into your project folder from a container you immediately delete.)
 
 ```powershell
 docker run -d --name vw-schema --network vw-migration `
@@ -183,6 +185,16 @@ There is no logging in by hand and no eyeballing vault items.
 ```powershell
 python verify_migration.py        # data gates → start app on Postgres → runtime checks
 ```
+
+> **Free host port 80 first.** When the data gates pass, the verifier starts
+> `vaultwarden-pg-app` on host port **80** (default) and checks `http://localhost/alive`.
+> The everyday Caddy stack publishes 80/443, so if it's up the start fails with
+> `Bind for 0.0.0.0:80 failed: port is already allocated`. Either stop the stack first
+> (`docker compose stop caddy` — its Vaultwarden backend is already stopped from §2 Step 0
+> anyway) or run the verifier on another port: `python verify_migration.py --port 8080`
+> (the `/alive` URL is derived from `--port`). Also: the verifier does **not** auto-remove
+> its app container — if a prior run left one behind it aborts with a `docker rm -f
+> vaultwarden-pg-app` hint; run that, then re-run.
 
 It runs five automated gates and **exits non-zero if any fails**, so it drops
 straight into CI or a PowerShell `if ($LASTEXITCODE) { ... }` check. Stdlib only —
